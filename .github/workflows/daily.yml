@@ -1,11 +1,9 @@
-name: Günlük Oksijen EPUB
+name: Oksijen Daily EPUB
 
 on:
   schedule:
-    # 03:00 UTC = 06:00 TR (yazın)
-    # 03:00 UTC = 06:00 TR (kışın 04:00 UTC olur, aşağıda ayarlanabilir)
     - cron: '0 3 * * *'
-  workflow_dispatch: {}   # Manuel tetikleme butonu
+  workflow_dispatch: {}
 
 jobs:
   build-epub:
@@ -13,23 +11,18 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Repo'yu çek
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Node.js kur
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Bağımlılıkları yükle
-        run: npm ci
+      - name: Install dependencies
+        run: npm install
 
-      - name: EPUB üret ve Drive'a yükle
+      - name: Build EPUB and upload to Drive
         env:
           OXY_SCRIPT_URL: ${{ secrets.OXY_SCRIPT_URL }}
         run: node index.js
-
-      - name: Log (başarısız olsa da görünsün)
-        if: always()
-        run: echo "İşlem tamamlandı: $(date -u)"
