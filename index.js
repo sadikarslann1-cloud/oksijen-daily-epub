@@ -1,10 +1,11 @@
 /**
- * Oksijen Günlük EPUB Üretici — v2.1
+ * Oksijen Günlük EPUB Üretici — v2.2
  * - 7 kategori (Türkiye, Dünya, Ekonomi, Bilim ve Teknoloji, Sağlık, Spor, Seyahat)
  * - Kategoriye göre gruplu sıralama
  * - Kitap içi "İçindekiler" sayfası + kategori ayraç sayfaları
  * - Renkli kapak + makale sayısı
  * - İki seviyeli TOC menüsü
+ * - Drive yükleme için 3 denemeli retry mekanizması
  */
 
 const JSZip = require('jszip');
@@ -237,7 +238,6 @@ async function scrapeAll() {
             await sleep(FETCH_DELAY_MS);
         }
 
-        // Kategori içi sıralama: yeni → eski
         catArticles.sort((a, b) => b.fullDateObj - a.fullDateObj);
         log(`✅ ${cat.name}: ${catArticles.length} makale alındı`);
         grouped.push({ cat, articles: catArticles });
@@ -345,7 +345,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
         const catId = `cat${gi + 1}`;
         const catFile = `cat${gi + 1}.xhtml`;
 
-        // --- AYRAÇ SAYFASI ---
         const catHtml = `<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>${htmlEscape(g.cat.name)}</title><meta charset="utf-8"/>
@@ -373,7 +372,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
 
         let catNavPoints = '';
 
-        // --- MAKALELER ---
         g.articles.forEach((art) => {
             itemCounter++;
             const itemId = `item${itemCounter}`;
@@ -421,9 +419,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
 </navPoint>`;
     });
 
-    // ==========================================
-    // content.opf + toc.ncx
-    // ==========================================
     const dcTitle = `Oksijen — ${catNames.join(', ')} (${displayDate} ${displayHour})`;
 
     oebps.file('content.opf', `<?xml version="1.0" encoding="utf-8"?>
@@ -455,31 +450,56 @@ async function buildEpub(grouped, displayDate, displayHour) {
 }
 
 // ==========================================
-// DRIVE YÜKLEME
+// DRIVE YÜKLEME (3 Denemeli Retry)
 // ==========================================
 async function uploadToDrive(base64, fileName) {
     log(`☁️ Drive'a yükleniyor: ${fileName}`);
-    try {
-        const res = await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: base64, filename: fileName })
-        });
-        log(`   ✓ HTTP ${res.status}`);
-        const text = await res.text();
-        log(`   Cevap: ${text.substring(0, 200)}`);
-        return res.ok;
-    } catch (e) {
-        log(`   ❌ Yükleme hatası: ${e.message}`);
-        return false;
+
+    const maxAttempts = 3;
+    const delays = [5000, 15000, 30000]; // 5 sn, 15 sn, 30 sn
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            log(`   Deneme ${attempt}/${maxAttempts}...`);
+
+            const res = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: base64, filename: fileName })
+            });
+
+            log(`   ✓ HTTP ${res.status}`);
+
+            if (res.ok) {
+                const text = await res.text();
+                log(`   Cevap: ${text.substring(0, 200)}`);
+                return true;
+            }
+
+            if (attempt < maxAttempts) {
+                const wait = delays[attempt - 1];
+                log(`   ⚠️ HTTP ${res.status} — ${wait / 1000} sn sonra tekrar denenecek...`);
+                await sleep(wait);
+            }
+        } catch (e) {
+            log(`   ⚠️ Deneme ${attempt} hata: ${e.message}`);
+            if (attempt < maxAttempts) {
+                const wait = delays[attempt - 1];
+                log(`   ${wait / 1000} sn sonra tekrar denenecek...`);
+                await sleep(wait);
+            }
+        }
     }
+
+    log(`   ❌ ${maxAttempts} deneme başarısız oldu`);
+    return false;
 }
 
 // ==========================================
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 Oksijen Günlük EPUB v2.1 başladı');
+    log('🚀 Oksijen Günlük EPUB v2.2 başladı');
     const startTime = Date.now();
 
     const grouped = await scrapeAll();
@@ -491,7 +511,6 @@ async function main() {
     log(`📚 Toplam ${totalArticles} makale toplandı`);
     grouped.forEach(g => log(`   • ${g.cat.name}: ${g.articles.length}`));
 
-    // Tarih / saat
     const now = new Date();
     const dateStr = now.toLocaleDateString('tr-TR', {
         day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
