@@ -1,15 +1,16 @@
 /**
- * T24 Günlük EPUB Üretici — v1.7
+ * T24 Günlük EPUB Üretici — v1.8
+ * - Playwright + Chromium ile gerçek tarayıcı (403 bypass)
  * - 4 kategori: Son Dakika, Gündem, Ekonomi, Dünya
- * - Cookie + Referer ile 403 bypass
  * - Kategoriye göre gruplu sıralama
- * - Kitap içi İçindekiler + kategori ayraçları
+ * - Kitap içi İçindekiler + kategori ayraçları (renkli)
  * - T24 kırmızı kapak
  * - 12 saat filtre, max 20/kategori, min 500 kr
  * - Duplicate engelle, URL query temizle
  * - Drive yükleme 3 deneme retry
  */
 
+const { chromium } = require('playwright');
 const JSZip = require('jszip');
 const cheerio = require('cheerio');
 
@@ -28,37 +29,15 @@ const CATEGORIES = [
 const HOURS_LOOKBACK = 12;
 const MAX_PER_CATEGORY = 20;
 const MIN_ARTICLE_LENGTH = 500;
-const FETCH_DELAY_MS = 400;
-const REQUEST_TIMEOUT_MS = 15000;
+const PAGE_WAIT_MS = 1200;
+const REQUEST_DELAY_MS = 600;
+const PAGE_TIMEOUT_MS = 30000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const APPS_SCRIPT_URL = process.env.OXY_SCRIPT_URL;
 if (!APPS_SCRIPT_URL) {
     console.error('❌ OXY_SCRIPT_URL ortam değişkeni tanımlı değil!');
     process.exit(1);
-}
-
-// ==========================================
-// COOKIE STORE (global)
-// ==========================================
-let COOKIE_JAR = '';
-
-function parseSetCookie(setCookieHeaders) {
-    if (!setCookieHeaders || !Array.isArray(setCookieHeaders)) return '';
-    return setCookieHeaders
-        .map(h => h.split(';')[0])
-        .filter(Boolean)
-        .join('; ');
-}
-
-function mergeCookies(existing, newCookies) {
-    if (!newCookies) return existing;
-    const map = new Map();
-    (existing + '; ' + newCookies).split('; ').filter(Boolean).forEach(pair => {
-        const [k, v] = pair.split('=');
-        if (k) map.set(k.trim(), (v || '').trim());
-    });
-    return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
 // ==========================================
@@ -121,66 +100,63 @@ function wrapText(items, maxChars) {
 }
 
 // ==========================================
-// FETCH (Cookie + Referer ile)
+// BROWSER YÖNETİMİ
 // ==========================================
-async function fetchWithTimeout(url, options = {}) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+let browser = null;
+let context = null;
+let page = null;
 
-    const headers = {
-        'User-Agent': USER_AGENT,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1',
-        'Referer': BASE + '/',
-        ...(options.headers || {})
-    };
-    if (COOKIE_JAR) headers['Cookie'] = COOKIE_JAR;
-
-    try {
-        const res = await fetch(url, {
-            ...options,
-            signal: controller.signal,
-            redirect: 'follow',
-            headers
-        });
-
-        // Set-Cookie'leri topla
-        const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-        if (setCookies && setCookies.length > 0) {
-            const parsed = parseSetCookie(setCookies);
-            COOKIE_JAR = mergeCookies(COOKIE_JAR, parsed);
+async function initBrowser() {
+    log('🌐 Chromium başlatılıyor...');
+    browser = await chromium.launch({
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled'
+        ]
+    });
+    context = await browser.newContext({
+        userAgent: USER_AGENT,
+        locale: 'tr-TR',
+        timezoneId: 'Europe/Istanbul',
+        viewport: { width: 1920, height: 1080 },
+        extraHTTPHeaders: {
+            'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8'
         }
+    });
+    page = await context.newPage();
+    log('   ✓ Chromium hazır');
 
-        clearTimeout(timer);
-        return res;
+    // Ana sayfaya gidip cookie ısıt
+    log('🍪 T24 ana sayfa ziyareti (cookie ısıtma)...');
+    try {
+        await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
+        await sleep(1500);
+        log(`   ✓ Ana sayfa yüklendi: ${page.url()}`);
     } catch (e) {
-        clearTimeout(timer);
-        throw e;
+        log(`   ⚠️ Ana sayfa hatası: ${e.message}`);
     }
 }
 
-// ==========================================
-// COOKIE ISITMA (Ana sayfa ziyareti)
-// ==========================================
-async function warmUpCookies() {
-    log('🍪 T24 ana sayfaya gidip cookie alınıyor...');
+async function closeBrowser() {
+    if (browser) {
+        try { await browser.close(); } catch (e) {}
+        browser = null;
+        context = null;
+        page = null;
+    }
+}
+
+async function fetchPageHtml(url) {
     try {
-        const res = await fetchWithTimeout(BASE + '/');
-        const html = await res.text();
-        log(`   ✓ HTTP ${res.status}, ${html.length} kr`);
-        log(`   🍪 Cookie: ${COOKIE_JAR.substring(0, 150) || '(yok)'}${COOKIE_JAR.length > 150 ? '...' : ''}`);
-        await sleep(800);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
+        await sleep(PAGE_WAIT_MS);
+        const html = await page.content();
+        return html;
     } catch (e) {
-        log(`   ⚠️ Cookie alma hatası: ${e.message}`);
+        log(`   ⚠️ Sayfa yükleme hatası: ${e.message}`);
+        return null;
     }
 }
 
@@ -275,9 +251,8 @@ async function fetchCategoryLinks(slug) {
     const url = `${BASE}/${slug}`;
     log(`📂 Kategori taranıyor: ${slug}`);
     try {
-        const res = await fetchWithTimeout(url);
-        if (!res.ok) { log(`   ⚠️ HTTP ${res.status}`); return []; }
-        const html = await res.text();
+        const html = await fetchPageHtml(url);
+        if (!html) { log(`   ❌ HTML alınamadı`); return []; }
         const $ = cheerio.load(html);
 
         const links = [];
@@ -339,23 +314,14 @@ function extractArticleContent($, title) {
     return cleanParagraphs(rawTexts, title).filter(p => p.length > 15);
 }
 
-async function fetchArticle(url, title, catObj, attempt = 1) {
+async function fetchArticle(url, title, catObj) {
     try {
-        const res = await fetchWithTimeout(url);
+        const html = await fetchPageHtml(url);
+        if (!html) { log(`   ❌ [HTML YOK] ${url}`); return null; }
 
-        // 403 alırsak → bir kez daha dene (cookie yenilensin diye ana sayfaya gidip)
-        if (res.status === 403 && attempt < 3) {
-            log(`   ⚠️ [403] tekrar deneniyor (${attempt}/2): ${url}`);
-            await sleep(2000);
-            await warmUpCookies();
-            return fetchArticle(url, title, catObj, attempt + 1);
-        }
-
-        if (!res.ok) { log(`   ❌ [HTTP ${res.status}] ${url}`); return null; }
-
-        const html = await res.text();
         const $ = cheerio.load(html);
 
+        // Tarih
         let publishedAt = null;
         const metaDate = $('meta[property="article:published_time"]').attr('content');
         if (metaDate) publishedAt = new Date(metaDate);
@@ -364,9 +330,11 @@ async function fetchArticle(url, title, catObj, attempt = 1) {
             return null;
         }
 
+        // Başlık
         const ogTitle = $('meta[property="og:title"]').attr('content');
         const finalTitle = norm(ogTitle) || title;
 
+        // İçerik
         const content = extractArticleContent($, finalTitle);
         if (!content || content.length === 0) {
             log(`   🚫 [İÇERİK BOŞ] ${url}`);
@@ -421,12 +389,12 @@ async function scrapeAll() {
             seenUrls.add(url);
 
             const article = await fetchArticle(url, title, cat);
-            if (!article) { await sleep(FETCH_DELAY_MS); continue; }
-            if (article.fullDateObj < cutoff) { await sleep(50); continue; }
+            if (!article) { await sleep(REQUEST_DELAY_MS); continue; }
+            if (article.fullDateObj < cutoff) { await sleep(100); continue; }
 
             catArticles.push(article);
             log(`   ✓ ${catArticles.length}. [${cat.name}] ${article.title.substring(0, 60)}`);
-            await sleep(FETCH_DELAY_MS);
+            await sleep(REQUEST_DELAY_MS);
 
             if (catArticles.length >= MAX_PER_CATEGORY) {
                 log(`   ⏹️ ${cat.name}: ${MAX_PER_CATEGORY} makale sınırına ulaşıldı`);
@@ -676,55 +644,63 @@ async function uploadToDrive(base64, fileName) {
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 T24 Günlük EPUB v1.7 başladı');
+    log('🚀 T24 Günlük EPUB v1.8 başladı');
     const startTime = Date.now();
 
-    // 1. ÖNCE COOKIE ISIT
-    await warmUpCookies();
+    try {
+        await initBrowser();
 
-    // 2. TARAMAYA BAŞLA
-    const grouped = await scrapeAll();
-    const totalArticles = grouped.reduce((sum, g) => sum + g.articles.length, 0);
-    if (totalArticles === 0) {
-        log('❌ Hiç makale bulunamadı, çıkılıyor.');
-        process.exit(1);
-    }
-    log(`📚 Toplam ${totalArticles} makale toplandı`);
-    grouped.forEach(g => log(`   • ${g.cat.name}: ${g.articles.length}`));
+        const grouped = await scrapeAll();
+        const totalArticles = grouped.reduce((sum, g) => sum + g.articles.length, 0);
+        if (totalArticles === 0) {
+            log('❌ Hiç makale bulunamadı, çıkılıyor.');
+            await closeBrowser();
+            process.exit(1);
+        }
+        log(`📚 Toplam ${totalArticles} makale toplandı`);
+        grouped.forEach(g => log(`   • ${g.cat.name}: ${g.articles.length}`));
 
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('tr-TR', {
-        day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
-    });
-    const hourUTC = now.getUTCHours();
-    const minuteUTC = now.getUTCMinutes();
-    const hourTR = (hourUTC + 3) % 24;
-    const hourSafe = String(hourTR).padStart(2, '0');
-    const minuteSafe = String(minuteUTC).padStart(2, '0');
-    const displayHour = `${hourSafe}:${minuteSafe} TR`;
-    const fileDate = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Istanbul' });
+        const now = new Date();
+        const dateStr = now.toLocaleDateString('tr-TR', {
+            day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
+        });
+        const hourUTC = now.getUTCHours();
+        const minuteUTC = now.getUTCMinutes();
+        const hourTR = (hourUTC + 3) % 24;
+        const hourSafe = String(hourTR).padStart(2, '0');
+        const minuteSafe = String(minuteUTC).padStart(2, '0');
+        const displayHour = `${hourSafe}:${minuteSafe} TR`;
+        const fileDate = now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Istanbul' });
 
-    log('📦 EPUB üretiliyor...');
-    const base64 = await buildEpub(grouped, dateStr, displayHour);
-    const sizeMB = (base64.length * 0.75 / 1024 / 1024).toFixed(2);
-    log(`   ✓ EPUB hazır (~${sizeMB} MB)`);
+        log('📦 EPUB üretiliyor...');
+        const base64 = await buildEpub(grouped, dateStr, displayHour);
+        const sizeMB = (base64.length * 0.75 / 1024 / 1024).toFixed(2);
+        log(`   ✓ EPUB hazır (~${sizeMB} MB)`);
 
-    const catPart = CATEGORIES.map(c => safeFileName(c.name).replace(/\s+/g, '')).join('-');
-    const fileName = `T24_${catPart}_${fileDate}_${hourSafe}-${minuteSafe}.epub`;
+        const catPart = CATEGORIES.map(c => safeFileName(c.name).replace(/\s+/g, '')).join('-');
+        const fileName = `T24_${catPart}_${fileDate}_${hourSafe}-${minuteSafe}.epub`;
 
-    const ok = await uploadToDrive(base64, fileName);
+        const ok = await uploadToDrive(base64, fileName);
 
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    if (ok) {
-        log(`✅ TAMAM — ${fileName} — ${duration}s`);
-        process.exit(0);
-    } else {
-        log(`❌ Drive yükleme başarısız`);
+        await closeBrowser();
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        if (ok) {
+            log(`✅ TAMAM — ${fileName} — ${duration}s`);
+            process.exit(0);
+        } else {
+            log(`❌ Drive yükleme başarısız`);
+            process.exit(1);
+        }
+    } catch (err) {
+        log(`💥 Kritik hata: ${err.message}`);
+        await closeBrowser();
         process.exit(1);
     }
 }
 
-main().catch(err => {
-    console.error('💥 Kritik hata:', err);
+main().catch(async err => {
+    console.error('💥 Yakalanmayan hata:', err);
+    await closeBrowser();
     process.exit(1);
 });
