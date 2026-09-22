@@ -1,12 +1,13 @@
 /**
- * T24 Günlük EPUB Üretici — v1.5
+ * T24 Günlük EPUB Üretici — v1.6
  * - 4 kategori: Son Dakika, Gündem, Ekonomi, Dünya
  * - Kategoriye göre gruplu sıralama
  * - Kitap içi İçindekiler + kategori ayraçları (renkli)
  * - T24 kırmızı kapak
- * - 12 saat filtre, max 20/kategori, min 300 kr
+ * - 12 saat filtre, max 20/kategori, min 500 kr
  * - Duplicate engelle, URL query temizle
- * - Paywall atla
+ * - Paywall tespiti: içerik uzunluğuna göre (class'a göre DEĞİL)
+ * - Related haberler + abonelik metinleri filtrelenir
  * - Drive yükleme 3 deneme retry
  */
 
@@ -27,7 +28,7 @@ const CATEGORIES = [
 
 const HOURS_LOOKBACK = 12;
 const MAX_PER_CATEGORY = 20;
-const MIN_ARTICLE_LENGTH = 300;
+const MIN_ARTICLE_LENGTH = 500;  // Paywall tespiti için de kullanılıyor
 const FETCH_DELAY_MS = 400;
 const REQUEST_TIMEOUT_MS = 15000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -135,24 +136,39 @@ const BAD_LINE_PATTERNS = [
     /^T24'E ABONE OL,?\s*$/i,
     /^BAĞIMSIZ GAZETECİLİĞİ DESTEKLE!?\s*$/i,
     /^ABONE OL\s*$/i,
-    /^Zaten abone misiniz\? Üye girişi yapın\.?\s*$/i
+    /^Zaten abone misiniz\? Üye girişi yapın\.?\s*$/i,
+    /abonelik hakkında sıkça sorulan sorular/i,
+    /reklamsız t24'e abone olun/i,
+    /t24'ün arkasındaki tek güç siz olun/i,
+    /\(editör:\s*[^)]+\)$/i
 ];
 
 const JUNK_SELECTORS = [
+    // Temel
     'script', 'style', 'noscript', 'iframe', 'svg', 'video', 'audio',
     'form', 'button', 'nav', 'footer', 'aside', 'table',
-    '.article-tags', '.share', '.social', '.related', '.comments',
+    // Reklam
     '.advertisement', '.ads', '[class*="banner"]', '[class*="reklam"]',
+    // Paylaşım / sosyal
+    '.article-tags', '.share', '.social', '.comments',
+    '.story-share', '.story-footer', '.main-menu-slider', '.consent-modal',
+    '.story-header',
+    // Abonelik
     '.t24-subscription-callout', '.t24-subscription-callout-login',
-    '[class*="subscription-callout"]', '[class*="abone-ol"]', '[class*="abone"]',
-    '.main-menu-slider', '.consent-modal', '.story-header',
-    '.story-share', '.story-footer'
+    '[class*="subscription-callout"]', '[class*="abone-ol"]',
+    '[class*="abone"]', '[class*="subscribe"]', '[class*="faq"]',
+    '.t24-faq', '[class*="sıkça-sorulan"]', '[class*="frequently-asked"]',
+    // Related / ilgili haberler (EN ÖNEMLİSİ)
+    '.related', '[class*="related"]', '[class*="ilgili"]',
+    '[class*="story-list"]', '[class*="story-related"]',
+    '[class*="other-news"]', '[class*="read-more"]',
+    '[class*="news-list"]', '.story-suggestions', '.story-link-list',
+    '[class*="suggestion"]', '[class*="oneri"]', '[class*="öneri"]',
+    '[class*="similar"]', '[class*="benzer"]'
 ];
 
-const PAYWALL_SELECTORS = [
-    '.t24-article-paywall',
-    '.t24-article-paywall-cta-top'
-];
+// Paywall tespiti artık class'a göre DEĞİL, içerik uzunluğuna göre
+const PAYWALL_SELECTORS = [];
 
 function isStopLine(line) {
     const lower = line.toLowerCase();
@@ -242,7 +258,7 @@ async function fetchCategoryLinks(slug) {
 // MAKALE İÇERİK ÇIKARMA (Hibrit)
 // ==========================================
 function extractArticleContent($, title) {
-    // 1. Container adayları (öncelikli → yedek → son çare)
+    // 1. Container adayları
     let $container = $('section.haberdetay').first();
     if (!$container.length) $container = $('.story-content').first();
     if (!$container.length) $container = $('body');
@@ -277,13 +293,7 @@ async function fetchArticle(url, title, catObj) {
         const html = await res.text();
         const $ = cheerio.load(html);
 
-        // Paywall kontrolü
-        for (const sel of PAYWALL_SELECTORS) {
-            if ($(sel).length > 0) {
-                log(`   🚫 [PAYWALL: ${sel}] ${url}`);
-                return null;
-            }
-        }
+        // Paywall class kontrolü YOK — içerik uzunluğuna göre karar verilecek
 
         // Tarih
         let publishedAt = null;
@@ -302,15 +312,14 @@ async function fetchArticle(url, title, catObj) {
         const content = extractArticleContent($, finalTitle);
         if (!content || content.length === 0) {
             const hasContainer = $('section.haberdetay').length > 0;
-            const hasBodyContent = $('#main-content, .content, article').length > 0;
-            log(`   🚫 [İÇERİK BOŞ] haberdetay=${hasContainer}, html=${html.length}kr, url=${url}`);
+            log(`   🚫 [İÇERİK BOŞ] haberdetay=${hasContainer}, url=${url}`);
             return null;
         }
 
-        // Min uzunluk
+        // Min uzunluk (paywall tespiti de bu)
         const totalLength = content.join(' ').length;
         if (totalLength < MIN_ARTICLE_LENGTH) {
-            log(`   🚫 [KISA: ${totalLength}kr < ${MIN_ARTICLE_LENGTH}] ${url}`);
+            log(`   🚫 [KISA/PAYWALL: ${totalLength}kr] ${url}`);
             return null;
         }
 
@@ -343,7 +352,7 @@ async function fetchArticle(url, title, catObj) {
 // ==========================================
 async function scrapeAll() {
     const grouped = [];
-    const seenUrls = new Set(); // Kategoriler arası duplicate
+    const seenUrls = new Set();
     const cutoff = new Date(Date.now() - HOURS_LOOKBACK * 3600000);
 
     for (const cat of CATEGORIES) {
@@ -396,7 +405,7 @@ async function buildEpub(grouped, displayDate, displayHour) {
     const activeCats = grouped.filter(g => g.articles.length > 0);
     const catNames = activeCats.map(g => g.cat.name);
 
-    // ============ KAPAK ============
+    // KAPAK
     const coverLines = wrapText(catNames, 42);
     const coverSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800" width="100%" height="100%">
@@ -420,7 +429,7 @@ async function buildEpub(grouped, displayDate, displayHour) {
   <img src="cover.svg" alt="Kapak" style="max-width:100%;max-height:100%;"/>
 </body></html>`);
 
-    // ============ KİTAP İÇİ İÇİNDEKİLER ============
+    // İÇİNDEKİLER SAYFASI
     const tocItemsHtml = activeCats.map((g, i) => {
         const catFile = `cat${i + 1}.xhtml`;
         return `<li style="margin: 14px 0; list-style: none;">
@@ -445,7 +454,7 @@ async function buildEpub(grouped, displayDate, displayHour) {
   <ul>${tocItemsHtml}</ul>
 </body></html>`);
 
-    // ============ MANIFEST / SPINE / NAVMAP ============
+    // MANIFEST / SPINE / NAVMAP
     let manifest = `
 <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
 <item id="cover-image" href="cover.svg" media-type="image/svg+xml"/>
@@ -465,7 +474,7 @@ async function buildEpub(grouped, displayDate, displayHour) {
     let playOrder = 2;
     let itemCounter = 0;
 
-    // ============ KATEGORİ AYRAÇLARI + MAKALELER ============
+    // KATEGORİ AYRAÇLARI + MAKALELER
     activeCats.forEach((g, gi) => {
         const catId = `cat${gi + 1}`;
         const catFile = `cat${gi + 1}.xhtml`;
@@ -619,7 +628,7 @@ async function uploadToDrive(base64, fileName) {
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 T24 Günlük EPUB v1.5 başladı');
+    log('🚀 T24 Günlük EPUB v1.6 başladı');
     const startTime = Date.now();
 
     const grouped = await scrapeAll();
