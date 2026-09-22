@@ -1,13 +1,12 @@
 /**
- * T24 Günlük EPUB Üretici — v1.6
+ * T24 Günlük EPUB Üretici — v1.7
  * - 4 kategori: Son Dakika, Gündem, Ekonomi, Dünya
+ * - Cookie + Referer ile 403 bypass
  * - Kategoriye göre gruplu sıralama
- * - Kitap içi İçindekiler + kategori ayraçları (renkli)
+ * - Kitap içi İçindekiler + kategori ayraçları
  * - T24 kırmızı kapak
  * - 12 saat filtre, max 20/kategori, min 500 kr
  * - Duplicate engelle, URL query temizle
- * - Paywall tespiti: içerik uzunluğuna göre (class'a göre DEĞİL)
- * - Related haberler + abonelik metinleri filtrelenir
  * - Drive yükleme 3 deneme retry
  */
 
@@ -28,7 +27,7 @@ const CATEGORIES = [
 
 const HOURS_LOOKBACK = 12;
 const MAX_PER_CATEGORY = 20;
-const MIN_ARTICLE_LENGTH = 500;  // Paywall tespiti için de kullanılıyor
+const MIN_ARTICLE_LENGTH = 500;
 const FETCH_DELAY_MS = 400;
 const REQUEST_TIMEOUT_MS = 15000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -37,6 +36,29 @@ const APPS_SCRIPT_URL = process.env.OXY_SCRIPT_URL;
 if (!APPS_SCRIPT_URL) {
     console.error('❌ OXY_SCRIPT_URL ortam değişkeni tanımlı değil!');
     process.exit(1);
+}
+
+// ==========================================
+// COOKIE STORE (global)
+// ==========================================
+let COOKIE_JAR = '';
+
+function parseSetCookie(setCookieHeaders) {
+    if (!setCookieHeaders || !Array.isArray(setCookieHeaders)) return '';
+    return setCookieHeaders
+        .map(h => h.split(';')[0])
+        .filter(Boolean)
+        .join('; ');
+}
+
+function mergeCookies(existing, newCookies) {
+    if (!newCookies) return existing;
+    const map = new Map();
+    (existing + '; ' + newCookies).split('; ').filter(Boolean).forEach(pair => {
+        const [k, v] = pair.split('=');
+        if (k) map.set(k.trim(), (v || '').trim());
+    });
+    return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
 // ==========================================
@@ -98,24 +120,67 @@ function wrapText(items, maxChars) {
     return lines;
 }
 
+// ==========================================
+// FETCH (Cookie + Referer ile)
+// ==========================================
 async function fetchWithTimeout(url, options = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const headers = {
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Referer': BASE + '/',
+        ...(options.headers || {})
+    };
+    if (COOKIE_JAR) headers['Cookie'] = COOKIE_JAR;
+
     try {
         const res = await fetch(url, {
             ...options,
             signal: controller.signal,
-            headers: {
-                'User-Agent': USER_AGENT,
-                'Accept-Language': 'tr,en;q=0.9',
-                ...(options.headers || {})
-            }
+            redirect: 'follow',
+            headers
         });
+
+        // Set-Cookie'leri topla
+        const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+        if (setCookies && setCookies.length > 0) {
+            const parsed = parseSetCookie(setCookies);
+            COOKIE_JAR = mergeCookies(COOKIE_JAR, parsed);
+        }
+
         clearTimeout(timer);
         return res;
     } catch (e) {
         clearTimeout(timer);
         throw e;
+    }
+}
+
+// ==========================================
+// COOKIE ISITMA (Ana sayfa ziyareti)
+// ==========================================
+async function warmUpCookies() {
+    log('🍪 T24 ana sayfaya gidip cookie alınıyor...');
+    try {
+        const res = await fetchWithTimeout(BASE + '/');
+        const html = await res.text();
+        log(`   ✓ HTTP ${res.status}, ${html.length} kr`);
+        log(`   🍪 Cookie: ${COOKIE_JAR.substring(0, 150) || '(yok)'}${COOKIE_JAR.length > 150 ? '...' : ''}`);
+        await sleep(800);
+    } catch (e) {
+        log(`   ⚠️ Cookie alma hatası: ${e.message}`);
     }
 }
 
@@ -144,21 +209,16 @@ const BAD_LINE_PATTERNS = [
 ];
 
 const JUNK_SELECTORS = [
-    // Temel
     'script', 'style', 'noscript', 'iframe', 'svg', 'video', 'audio',
     'form', 'button', 'nav', 'footer', 'aside', 'table',
-    // Reklam
     '.advertisement', '.ads', '[class*="banner"]', '[class*="reklam"]',
-    // Paylaşım / sosyal
     '.article-tags', '.share', '.social', '.comments',
     '.story-share', '.story-footer', '.main-menu-slider', '.consent-modal',
     '.story-header',
-    // Abonelik
     '.t24-subscription-callout', '.t24-subscription-callout-login',
     '[class*="subscription-callout"]', '[class*="abone-ol"]',
     '[class*="abone"]', '[class*="subscribe"]', '[class*="faq"]',
     '.t24-faq', '[class*="sıkça-sorulan"]', '[class*="frequently-asked"]',
-    // Related / ilgili haberler (EN ÖNEMLİSİ)
     '.related', '[class*="related"]', '[class*="ilgili"]',
     '[class*="story-list"]', '[class*="story-related"]',
     '[class*="other-news"]', '[class*="read-more"]',
@@ -166,9 +226,6 @@ const JUNK_SELECTORS = [
     '[class*="suggestion"]', '[class*="oneri"]', '[class*="öneri"]',
     '[class*="similar"]', '[class*="benzer"]'
 ];
-
-// Paywall tespiti artık class'a göre DEĞİL, içerik uzunluğuna göre
-const PAYWALL_SELECTORS = [];
 
 function isStopLine(line) {
     const lower = line.toLowerCase();
@@ -255,27 +312,23 @@ async function fetchCategoryLinks(slug) {
 }
 
 // ==========================================
-// MAKALE İÇERİK ÇIKARMA (Hibrit)
+// MAKALE İÇERİK ÇIKARMA
 // ==========================================
 function extractArticleContent($, title) {
-    // 1. Container adayları
     let $container = $('section.haberdetay').first();
     if (!$container.length) $container = $('.story-content').first();
     if (!$container.length) $container = $('body');
 
-    // 2. Junk temizle
     JUNK_SELECTORS.forEach(sel => {
         try { $container.find(sel).remove(); } catch (e) {}
     });
 
-    // 3. Paragrafları topla
     const rawTexts = [];
     $container.find('p, h2, h3, h4, blockquote, li').each((_, el) => {
         const text = norm($(el).text());
         if (text.length > 10) rawTexts.push(text);
     });
 
-    // 4. Fallback: paragraf az ise text node'ları kullan
     if (rawTexts.length < 3) {
         const raw = norm($container.text());
         raw.split(/\n+/).forEach(p => {
@@ -286,16 +339,23 @@ function extractArticleContent($, title) {
     return cleanParagraphs(rawTexts, title).filter(p => p.length > 15);
 }
 
-async function fetchArticle(url, title, catObj) {
+async function fetchArticle(url, title, catObj, attempt = 1) {
     try {
         const res = await fetchWithTimeout(url);
+
+        // 403 alırsak → bir kez daha dene (cookie yenilensin diye ana sayfaya gidip)
+        if (res.status === 403 && attempt < 3) {
+            log(`   ⚠️ [403] tekrar deneniyor (${attempt}/2): ${url}`);
+            await sleep(2000);
+            await warmUpCookies();
+            return fetchArticle(url, title, catObj, attempt + 1);
+        }
+
         if (!res.ok) { log(`   ❌ [HTTP ${res.status}] ${url}`); return null; }
+
         const html = await res.text();
         const $ = cheerio.load(html);
 
-        // Paywall class kontrolü YOK — içerik uzunluğuna göre karar verilecek
-
-        // Tarih
         let publishedAt = null;
         const metaDate = $('meta[property="article:published_time"]').attr('content');
         if (metaDate) publishedAt = new Date(metaDate);
@@ -304,26 +364,21 @@ async function fetchArticle(url, title, catObj) {
             return null;
         }
 
-        // Başlık (og:title öncelikli)
         const ogTitle = $('meta[property="og:title"]').attr('content');
         const finalTitle = norm(ogTitle) || title;
 
-        // İçerik
         const content = extractArticleContent($, finalTitle);
         if (!content || content.length === 0) {
-            const hasContainer = $('section.haberdetay').length > 0;
-            log(`   🚫 [İÇERİK BOŞ] haberdetay=${hasContainer}, url=${url}`);
+            log(`   🚫 [İÇERİK BOŞ] ${url}`);
             return null;
         }
 
-        // Min uzunluk (paywall tespiti de bu)
         const totalLength = content.join(' ').length;
         if (totalLength < MIN_ARTICLE_LENGTH) {
             log(`   🚫 [KISA/PAYWALL: ${totalLength}kr] ${url}`);
             return null;
         }
 
-        // Tarih/saat formatı
         const trDate = publishedAt.toLocaleDateString('tr-TR', {
             day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
         });
@@ -405,7 +460,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
     const activeCats = grouped.filter(g => g.articles.length > 0);
     const catNames = activeCats.map(g => g.cat.name);
 
-    // KAPAK
     const coverLines = wrapText(catNames, 42);
     const coverSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800" width="100%" height="100%">
@@ -429,7 +483,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
   <img src="cover.svg" alt="Kapak" style="max-width:100%;max-height:100%;"/>
 </body></html>`);
 
-    // İÇİNDEKİLER SAYFASI
     const tocItemsHtml = activeCats.map((g, i) => {
         const catFile = `cat${i + 1}.xhtml`;
         return `<li style="margin: 14px 0; list-style: none;">
@@ -454,7 +507,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
   <ul>${tocItemsHtml}</ul>
 </body></html>`);
 
-    // MANIFEST / SPINE / NAVMAP
     let manifest = `
 <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
 <item id="cover-image" href="cover.svg" media-type="image/svg+xml"/>
@@ -474,7 +526,6 @@ async function buildEpub(grouped, displayDate, displayHour) {
     let playOrder = 2;
     let itemCounter = 0;
 
-    // KATEGORİ AYRAÇLARI + MAKALELER
     activeCats.forEach((g, gi) => {
         const catId = `cat${gi + 1}`;
         const catFile = `cat${gi + 1}.xhtml`;
@@ -584,11 +635,10 @@ async function buildEpub(grouped, displayDate, displayHour) {
 }
 
 // ==========================================
-// DRIVE YÜKLEME (3 RETRY)
+// DRIVE YÜKLEME
 // ==========================================
 async function uploadToDrive(base64, fileName) {
     log(`☁️ Drive'a yükleniyor: ${fileName}`);
-
     const maxAttempts = 3;
     const delays = [5000, 15000, 30000];
 
@@ -614,9 +664,7 @@ async function uploadToDrive(base64, fileName) {
         } catch (e) {
             log(`   ⚠️ Deneme ${attempt} hata: ${e.message}`);
             if (attempt < maxAttempts) {
-                const wait = delays[attempt - 1];
-                log(`   ${wait / 1000} sn sonra tekrar denenecek...`);
-                await sleep(wait);
+                await sleep(delays[attempt - 1]);
             }
         }
     }
@@ -628,9 +676,13 @@ async function uploadToDrive(base64, fileName) {
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 T24 Günlük EPUB v1.6 başladı');
+    log('🚀 T24 Günlük EPUB v1.7 başladı');
     const startTime = Date.now();
 
+    // 1. ÖNCE COOKIE ISIT
+    await warmUpCookies();
+
+    // 2. TARAMAYA BAŞLA
     const grouped = await scrapeAll();
     const totalArticles = grouped.reduce((sum, g) => sum + g.articles.length, 0);
     if (totalArticles === 0) {
