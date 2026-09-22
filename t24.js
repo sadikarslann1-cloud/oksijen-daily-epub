@@ -1,11 +1,11 @@
 /**
- * T24 Günlük EPUB Üretici — v1.8
- * - Playwright + Chromium ile gerçek tarayıcı (403 bypass)
+ * T24 Günlük EPUB Üretici — v1.9
+ * - Playwright + Chromium (403 bypass)
  * - 4 kategori: Son Dakika, Gündem, Ekonomi, Dünya
  * - Kategoriye göre gruplu sıralama
- * - Kitap içi İçindekiler + kategori ayraçları (renkli)
- * - T24 kırmızı kapak
+ * - İçindekiler + kategori ayraçları + T24 kırmızı kapak
  * - 12 saat filtre, max 20/kategori, min 500 kr
+ * - Tarih bulunamazsa makale yine alınır (dateUnknown flag)
  * - Duplicate engelle, URL query temizle
  * - Drive yükleme 3 deneme retry
  */
@@ -128,7 +128,6 @@ async function initBrowser() {
     page = await context.newPage();
     log('   ✓ Chromium hazır');
 
-    // Ana sayfaya gidip cookie ısıt
     log('🍪 T24 ana sayfa ziyareti (cookie ısıtma)...');
     try {
         await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
@@ -314,6 +313,71 @@ function extractArticleContent($, title) {
     return cleanParagraphs(rawTexts, title).filter(p => p.length > 15);
 }
 
+// ==========================================
+// TARİH ÇIKARMA (Çok katmanlı)
+// ==========================================
+function extractDate($) {
+    // 1) article:published_time
+    let metaDate = $('meta[property="article:published_time"]').attr('content');
+    if (metaDate) {
+        const d = new Date(metaDate);
+        if (!isNaN(d.getTime())) return d;
+    }
+
+    // 2) article:modified_time
+    metaDate = $('meta[property="article:modified_time"]').attr('content');
+    if (metaDate) {
+        const d = new Date(metaDate);
+        if (!isNaN(d.getTime())) return d;
+    }
+
+    // 3) og:published_time
+    metaDate = $('meta[property="og:published_time"]').attr('content');
+    if (metaDate) {
+        const d = new Date(metaDate);
+        if (!isNaN(d.getTime())) return d;
+    }
+
+    // 4) <time datetime="...">
+    const timeEl = $('time[datetime]').first();
+    if (timeEl.length) {
+        const dt = timeEl.attr('datetime');
+        if (dt) {
+            const d = new Date(dt);
+            if (!isNaN(d.getTime())) return d;
+        }
+    }
+
+    // 5) Body'de Türkçe tarih
+    const bodyText = $('body').text();
+    const trMatch = bodyText.match(/(\d{1,2})\s+(Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+(20\d{2})(?:\s+(\d{1,2}):(\d{2}))?/);
+    if (trMatch) {
+        const M = { 'Ocak':0,'Şubat':1,'Mart':2,'Nisan':3,'Mayıs':4,'Haziran':5,
+                    'Temmuz':6,'Ağustos':7,'Eylül':8,'Ekim':9,'Kasım':10,'Aralık':11 };
+        const day = parseInt(trMatch[1], 10);
+        const month = M[trMatch[2]];
+        const year = parseInt(trMatch[3], 10);
+        const hour = trMatch[4] ? parseInt(trMatch[4], 10) : 12;
+        const minute = trMatch[5] ? parseInt(trMatch[5], 10) : 0;
+        if (month !== undefined) {
+            const d = new Date(year, month, day, hour, minute);
+            if (!isNaN(d.getTime())) return d;
+        }
+    }
+
+    return null;
+}
+
+function formatDate(d) {
+    const trDate = d.toLocaleDateString('tr-TR', {
+        day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
+    });
+    const trTime = d.toLocaleTimeString('tr-TR', {
+        hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Istanbul'
+    });
+    return `${trDate} · ${trTime}`;
+}
+
 async function fetchArticle(url, title, catObj) {
     try {
         const html = await fetchPageHtml(url);
@@ -321,56 +385,12 @@ async function fetchArticle(url, title, catObj) {
 
         const $ = cheerio.load(html);
 
-                // Tarih — çok katmanlı fallback
-        let publishedAt = null;
-
-        // 1) article:published_time
-        let metaDate = $('meta[property="article:published_time"]').attr('content');
-        if (metaDate) publishedAt = new Date(metaDate);
-
-        // 2) article:modified_time (fallback)
-        if (!publishedAt || isNaN(publishedAt.getTime())) {
-            metaDate = $('meta[property="article:modified_time"]').attr('content');
-            if (metaDate) publishedAt = new Date(metaDate);
-        }
-
-        // 3) og:published_time
-        if (!publishedAt || isNaN(publishedAt.getTime())) {
-            metaDate = $('meta[property="og:published_time"]').attr('content');
-            if (metaDate) publishedAt = new Date(metaDate);
-        }
-
-        // 4) <time datetime="..."> tag
-        if (!publishedAt || isNaN(publishedAt.getTime())) {
-            const timeEl = $('time[datetime]').first();
-            if (timeEl.length) {
-                const dt = timeEl.attr('datetime');
-                if (dt) publishedAt = new Date(dt);
-            }
-        }
-
-        // 5) Body'den Türkçe tarih regex
-        if (!publishedAt || isNaN(publishedAt.getTime())) {
-            const bodyText = $('body').text();
-            // Örn: "22 Eylül 2026 17:37" veya "22 Eylül 2026"
-            const trMatch = bodyText.match(/(\d{1,2})\s+(Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+(20\d{2})(?:\s+(\d{1,2}):(\d{2}))?/);
-            if (trMatch) {
-                const M = { 'Ocak':0,'Şubat':1,'Mart':2,'Nisan':3,'Mayıs':4,'Haziran':5,
-                            'Temmuz':6,'Ağustos':7,'Eylül':8,'Ekim':9,'Kasım':10,'Aralık':11 };
-                const day = parseInt(trMatch[1], 10);
-                const month = M[trMatch[2]];
-                const year = parseInt(trMatch[3], 10);
-                const hour = trMatch[4] ? parseInt(trMatch[4], 10) : 12;
-                const minute = trMatch[5] ? parseInt(trMatch[5], 10) : 0;
-                if (month !== undefined) {
-                    publishedAt = new Date(year, month, day, hour, minute);
-                }
-            }
-        }
-
-        if (!publishedAt || isNaN(publishedAt.getTime())) {
-            log(`   🚫 [TARİH YOK] ${url}`);
-            return null;
+        // Tarih çıkarma (çok katmanlı)
+        let publishedAt = extractDate($);
+        let dateUnknown = false;
+        if (!publishedAt) {
+            dateUnknown = true;
+            publishedAt = new Date(); // sıralama için şimdiki zaman
         }
 
         // Başlık
@@ -390,12 +410,7 @@ async function fetchArticle(url, title, catObj) {
             return null;
         }
 
-        const trDate = publishedAt.toLocaleDateString('tr-TR', {
-            day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Istanbul'
-        });
-        const trTime = publishedAt.toLocaleTimeString('tr-TR', {
-            hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Istanbul'
-        });
+        const publishDateStr = dateUnknown ? 'Tarih bilinmiyor' : formatDate(publishedAt);
 
         return {
             url,
@@ -404,8 +419,9 @@ async function fetchArticle(url, title, catObj) {
             catName: catObj.name,
             catColor: catObj.color,
             source: 'T24',
-            publishDateStr: `${trDate} · ${trTime}`,
-            fullDateObj: publishedAt
+            publishDateStr,
+            fullDateObj: publishedAt,
+            dateUnknown
         };
     } catch (e) {
         log(`   ⚠️ Makale hata: ${e.message}`);
@@ -433,10 +449,16 @@ async function scrapeAll() {
 
             const article = await fetchArticle(url, title, cat);
             if (!article) { await sleep(REQUEST_DELAY_MS); continue; }
-            if (article.fullDateObj < cutoff) { await sleep(100); continue; }
+
+            // Tarih filtresi: sadece tarihi bilinen makaleler için
+            if (!article.dateUnknown && article.fullDateObj < cutoff) {
+                await sleep(100);
+                continue;
+            }
 
             catArticles.push(article);
-            log(`   ✓ ${catArticles.length}. [${cat.name}] ${article.title.substring(0, 60)}`);
+            const dateTag = article.dateUnknown ? '⚠️ ' : '✓ ';
+            log(`   ${dateTag}${catArticles.length}. [${cat.name}] ${article.title.substring(0, 60)}`);
             await sleep(REQUEST_DELAY_MS);
 
             if (catArticles.length >= MAX_PER_CATEGORY) {
@@ -445,7 +467,13 @@ async function scrapeAll() {
             }
         }
 
-        catArticles.sort((a, b) => b.fullDateObj - a.fullDateObj);
+        // Sıralama: tarihi bilinenler önce, bilinmeyenler en sonda
+        catArticles.sort((a, b) => {
+            if (a.dateUnknown && !b.dateUnknown) return 1;
+            if (!a.dateUnknown && b.dateUnknown) return -1;
+            return b.fullDateObj - a.fullDateObj;
+        });
+
         log(`✅ ${cat.name}: ${catArticles.length} makale alındı`);
         grouped.push({ cat, articles: catArticles });
     }
@@ -687,7 +715,7 @@ async function uploadToDrive(base64, fileName) {
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 T24 Günlük EPUB v1.8 başladı');
+    log('🚀 T24 Günlük EPUB v1.9 başladı');
     const startTime = Date.now();
 
     try {
