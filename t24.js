@@ -273,20 +273,26 @@ function extractArticleContent($, title) {
 async function fetchArticle(url, title, catObj) {
     try {
         const res = await fetchWithTimeout(url);
-        if (!res.ok) return null;
+        if (!res.ok) { log(`   ❌ [HTTP ${res.status}] ${url}`); return null; }
         const html = await res.text();
         const $ = cheerio.load(html);
 
         // Paywall kontrolü
         for (const sel of PAYWALL_SELECTORS) {
-            if ($(sel).length > 0) return null;
+            if ($(sel).length > 0) {
+                log(`   🚫 [PAYWALL: ${sel}] ${url}`);
+                return null;
+            }
         }
 
         // Tarih
         let publishedAt = null;
         const metaDate = $('meta[property="article:published_time"]').attr('content');
         if (metaDate) publishedAt = new Date(metaDate);
-        if (!publishedAt || isNaN(publishedAt.getTime())) return null;
+        if (!publishedAt || isNaN(publishedAt.getTime())) {
+            log(`   🚫 [TARİH YOK] ${url}`);
+            return null;
+        }
 
         // Başlık (og:title öncelikli)
         const ogTitle = $('meta[property="og:title"]').attr('content');
@@ -294,11 +300,19 @@ async function fetchArticle(url, title, catObj) {
 
         // İçerik
         const content = extractArticleContent($, finalTitle);
-        if (!content || content.length === 0) return null;
+        if (!content || content.length === 0) {
+            const hasContainer = $('section.haberdetay').length > 0;
+            const hasBodyContent = $('#main-content, .content, article').length > 0;
+            log(`   🚫 [İÇERİK BOŞ] haberdetay=${hasContainer}, html=${html.length}kr, url=${url}`);
+            return null;
+        }
 
         // Min uzunluk
         const totalLength = content.join(' ').length;
-        if (totalLength < MIN_ARTICLE_LENGTH) return null;
+        if (totalLength < MIN_ARTICLE_LENGTH) {
+            log(`   🚫 [KISA: ${totalLength}kr < ${MIN_ARTICLE_LENGTH}] ${url}`);
+            return null;
+        }
 
         // Tarih/saat formatı
         const trDate = publishedAt.toLocaleDateString('tr-TR', {
