@@ -321,10 +321,53 @@ async function fetchArticle(url, title, catObj) {
 
         const $ = cheerio.load(html);
 
-        // Tarih
+                // Tarih — çok katmanlı fallback
         let publishedAt = null;
-        const metaDate = $('meta[property="article:published_time"]').attr('content');
+
+        // 1) article:published_time
+        let metaDate = $('meta[property="article:published_time"]').attr('content');
         if (metaDate) publishedAt = new Date(metaDate);
+
+        // 2) article:modified_time (fallback)
+        if (!publishedAt || isNaN(publishedAt.getTime())) {
+            metaDate = $('meta[property="article:modified_time"]').attr('content');
+            if (metaDate) publishedAt = new Date(metaDate);
+        }
+
+        // 3) og:published_time
+        if (!publishedAt || isNaN(publishedAt.getTime())) {
+            metaDate = $('meta[property="og:published_time"]').attr('content');
+            if (metaDate) publishedAt = new Date(metaDate);
+        }
+
+        // 4) <time datetime="..."> tag
+        if (!publishedAt || isNaN(publishedAt.getTime())) {
+            const timeEl = $('time[datetime]').first();
+            if (timeEl.length) {
+                const dt = timeEl.attr('datetime');
+                if (dt) publishedAt = new Date(dt);
+            }
+        }
+
+        // 5) Body'den Türkçe tarih regex
+        if (!publishedAt || isNaN(publishedAt.getTime())) {
+            const bodyText = $('body').text();
+            // Örn: "22 Eylül 2026 17:37" veya "22 Eylül 2026"
+            const trMatch = bodyText.match(/(\d{1,2})\s+(Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+(20\d{2})(?:\s+(\d{1,2}):(\d{2}))?/);
+            if (trMatch) {
+                const M = { 'Ocak':0,'Şubat':1,'Mart':2,'Nisan':3,'Mayıs':4,'Haziran':5,
+                            'Temmuz':6,'Ağustos':7,'Eylül':8,'Ekim':9,'Kasım':10,'Aralık':11 };
+                const day = parseInt(trMatch[1], 10);
+                const month = M[trMatch[2]];
+                const year = parseInt(trMatch[3], 10);
+                const hour = trMatch[4] ? parseInt(trMatch[4], 10) : 12;
+                const minute = trMatch[5] ? parseInt(trMatch[5], 10) : 0;
+                if (month !== undefined) {
+                    publishedAt = new Date(year, month, day, hour, minute);
+                }
+            }
+        }
+
         if (!publishedAt || isNaN(publishedAt.getTime())) {
             log(`   🚫 [TARİH YOK] ${url}`);
             return null;
