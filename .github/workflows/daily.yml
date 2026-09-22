@@ -1,15 +1,26 @@
-name: Oksijen Daily EPUB
+name: Daily EPUBs (Oksijen + T24)
 
 on:
   schedule:
-    # 06:00 TR = 03:00 UTC
-    - cron: '0 3 * * *'
-    # 16:00 TR = 13:00 UTC
-    - cron: '0 13 * * *'
-  workflow_dispatch: {}
+    - cron: '50 2 * * *'   # 05:50 TR — T24
+    - cron: '0 3 * * *'    # 06:00 TR — Oksijen
+    - cron: '50 12 * * *'  # 15:50 TR — T24
+    - cron: '0 13 * * *'   # 16:00 TR — Oksijen
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Hangi site inşa edilsin?'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - t24
+          - oksijen
 
 jobs:
-  build-epub:
+  build-t24:
+    if: (github.event_name == 'workflow_dispatch' && (github.event.inputs.build_target == 'both' || github.event.inputs.build_target == 't24')) || github.event.schedule == '50 2 * * *' || github.event.schedule == '50 12 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -25,7 +36,29 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build EPUB and upload to Drive
+      - name: Build T24 EPUB and upload to Drive
+        env:
+          OXY_SCRIPT_URL: ${{ secrets.OXY_SCRIPT_URL }}
+        run: node t24.js
+
+  build-oksijen:
+    if: (github.event_name == 'workflow_dispatch' && (github.event.inputs.build_target == 'both' || github.event.inputs.build_target == 'oksijen')) || github.event.schedule == '0 3 * * *' || github.event.schedule == '0 13 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Oksijen EPUB and upload to Drive
         env:
           OXY_SCRIPT_URL: ${{ secrets.OXY_SCRIPT_URL }}
         run: node index.js
