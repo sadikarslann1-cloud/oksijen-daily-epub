@@ -151,8 +151,7 @@ const JUNK_SELECTORS = [
 
 const PAYWALL_SELECTORS = [
     '.t24-article-paywall',
-    '.t24-article-paywall-cta-top',
-    '[class*="paywall"]'
+    '.t24-article-paywall-cta-top'
 ];
 
 function isStopLine(line) {
