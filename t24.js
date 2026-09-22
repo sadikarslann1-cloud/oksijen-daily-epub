@@ -1,11 +1,12 @@
 /**
- * T24 Günlük EPUB Üretici — v1.9
+ * T24 Günlük EPUB Üretici — v2.0
  * - Playwright + Chromium (403 bypass)
+ * - Userscript yaklaşımıyla içerik çıkarma (body clone + junk temizle)
  * - 4 kategori: Son Dakika, Gündem, Ekonomi, Dünya
+ * - Tarih opsiyonel (5 katmanlı fallback)
  * - Kategoriye göre gruplu sıralama
  * - İçindekiler + kategori ayraçları + T24 kırmızı kapak
- * - 12 saat filtre, max 20/kategori, min 500 kr
- * - Tarih bulunamazsa makale yine alınır (dateUnknown flag)
+ * - 12 saat filtre, max 20/kategori, min 150 kr
  * - Duplicate engelle, URL query temizle
  * - Drive yükleme 3 deneme retry
  */
@@ -28,8 +29,8 @@ const CATEGORIES = [
 
 const HOURS_LOOKBACK = 12;
 const MAX_PER_CATEGORY = 20;
-const MIN_ARTICLE_LENGTH = 500;
-const PAGE_WAIT_MS = 1200;
+const MIN_ARTICLE_LENGTH = 150;  // düşürüldü (250 kr sorunundan sonra)
+const PAGE_WAIT_MS = 2500;       // artırıldı (JS içerik yüklenmesi için)
 const REQUEST_DELAY_MS = 600;
 const PAGE_TIMEOUT_MS = 30000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -150,6 +151,7 @@ async function closeBrowser() {
 async function fetchPageHtml(url) {
     try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
+        // JS içeriğin yüklenmesi için bekle
         await sleep(PAGE_WAIT_MS);
         const html = await page.content();
         return html;
@@ -161,6 +163,7 @@ async function fetchPageHtml(url) {
 
 // ==========================================
 // İÇERİK TEMİZLEME KURALLARI
+// (Userscript'ten uyarlanmış — daha az agresif)
 // ==========================================
 const STOP_MARKERS = ['t24. tüm hakları saklıdır.'];
 
@@ -183,23 +186,14 @@ const BAD_LINE_PATTERNS = [
     /\(editör:\s*[^)]+\)$/i
 ];
 
+// Userscript'teki gibi — daha az agresif liste
 const JUNK_SELECTORS = [
     'script', 'style', 'noscript', 'iframe', 'svg', 'video', 'audio',
     'form', 'button', 'nav', 'footer', 'aside', 'table',
+    '.article-tags', '.share', '.social', '.related', '.comments',
     '.advertisement', '.ads', '[class*="banner"]', '[class*="reklam"]',
-    '.article-tags', '.share', '.social', '.comments',
-    '.story-share', '.story-footer', '.main-menu-slider', '.consent-modal',
-    '.story-header',
     '.t24-subscription-callout', '.t24-subscription-callout-login',
-    '[class*="subscription-callout"]', '[class*="abone-ol"]',
-    '[class*="abone"]', '[class*="subscribe"]', '[class*="faq"]',
-    '.t24-faq', '[class*="sıkça-sorulan"]', '[class*="frequently-asked"]',
-    '.related', '[class*="related"]', '[class*="ilgili"]',
-    '[class*="story-list"]', '[class*="story-related"]',
-    '[class*="other-news"]', '[class*="read-more"]',
-    '[class*="news-list"]', '.story-suggestions', '.story-link-list',
-    '[class*="suggestion"]', '[class*="oneri"]', '[class*="öneri"]',
-    '[class*="similar"]', '[class*="benzer"]'
+    '[class*="subscription-callout"]', '[class*="abone-ol"]', '[class*="abone"]'
 ];
 
 function isStopLine(line) {
@@ -287,30 +281,35 @@ async function fetchCategoryLinks(slug) {
 
 // ==========================================
 // MAKALE İÇERİK ÇIKARMA
+// (Userscript yaklaşımı — body clone + junk temizle)
 // ==========================================
 function extractArticleContent($, title) {
-    let $container = $('section.haberdetay').first();
-    if (!$container.length) $container = $('.story-content').first();
-    if (!$container.length) $container = $('body');
+    // Userscript yaklaşımı: tüm body'yi clone'la
+    const $clone = cheerio.load($.html());
 
+    // Junk temizle (userscript listesi)
     JUNK_SELECTORS.forEach(sel => {
-        try { $container.find(sel).remove(); } catch (e) {}
+        try { $clone(sel).remove(); } catch (e) {}
     });
 
+    // Body'den tüm p, h2, h3, h4, blockquote topla
     const rawTexts = [];
-    $container.find('p, h2, h3, h4, blockquote, li').each((_, el) => {
-        const text = norm($(el).text());
-        if (text.length > 10) rawTexts.push(text);
+    $clone('p, h2, h3, h4, blockquote').each((_, el) => {
+        const text = norm($clone(el).text());
+        if (text) rawTexts.push(text);
     });
 
-    if (rawTexts.length < 3) {
-        const raw = norm($container.text());
-        raw.split(/\n+/).forEach(p => {
-            if (p.length > 20) rawTexts.push(p);
-        });
+    let paragraphs = cleanParagraphs(rawTexts, title);
+
+    // Fallback: yeterli paragraf yoksa body text'i satırlara böl
+    if (paragraphs.length < 5) {
+        const bodyText = $clone('body').text() || '';
+        if (bodyText.length > 200) {
+            paragraphs = cleanParagraphs(bodyText.split(/\n+/), title);
+        }
     }
 
-    return cleanParagraphs(rawTexts, title).filter(p => p.length > 15);
+    return paragraphs.filter(p => p.length > 20);
 }
 
 // ==========================================
@@ -385,12 +384,12 @@ async function fetchArticle(url, title, catObj) {
 
         const $ = cheerio.load(html);
 
-        // Tarih çıkarma (çok katmanlı)
+        // Tarih çıkarma (opsiyonel)
         let publishedAt = extractDate($);
         let dateUnknown = false;
         if (!publishedAt) {
             dateUnknown = true;
-            publishedAt = new Date(); // sıralama için şimdiki zaman
+            publishedAt = new Date();
         }
 
         // Başlık
@@ -406,7 +405,7 @@ async function fetchArticle(url, title, catObj) {
 
         const totalLength = content.join(' ').length;
         if (totalLength < MIN_ARTICLE_LENGTH) {
-            log(`   🚫 [KISA/PAYWALL: ${totalLength}kr] ${url}`);
+            log(`   🚫 [KISA: ${totalLength}kr] ${url}`);
             return null;
         }
 
@@ -467,7 +466,6 @@ async function scrapeAll() {
             }
         }
 
-        // Sıralama: tarihi bilinenler önce, bilinmeyenler en sonda
         catArticles.sort((a, b) => {
             if (a.dateUnknown && !b.dateUnknown) return 1;
             if (!a.dateUnknown && b.dateUnknown) return -1;
@@ -715,7 +713,7 @@ async function uploadToDrive(base64, fileName) {
 // ANA AKIŞ
 // ==========================================
 async function main() {
-    log('🚀 T24 Günlük EPUB v1.9 başladı');
+    log('🚀 T24 Günlük EPUB v2.0 başladı');
     const startTime = Date.now();
 
     try {
