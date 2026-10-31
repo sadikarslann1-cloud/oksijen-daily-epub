@@ -1,9 +1,9 @@
 /**
- * Oksijen Günlük EPUB Üretici – v3.0 (Playwright + Login + 403/Paywall Bypass)
+ * Oksijen Günlük EPUB Üretici – v3.1 (Playwright + Login + 403/Paywall Bypass)
  * - 4 kategori: Türkiye, Dünya, Ekonomi, New York Times
  * - Playwright ile tek oturumda gerçek tarayıcı + E-posta/Şifre ile abone girişi
  * - Son 12 saat filtresi (workflow_dispatch ile değiştirilebilir)
- * - "Editörün Seçtikleri" ve telif metni temizliği
+ * - `.resizable-text` makale gövdesi + JSON-LD / "Haber Giriş" tarih yakalama
  * - Kategoriye göre gruplu, renkli ayraçlı, iki seviyeli TOC menülü EPUB
  * - Google Drive yükleme (3 denemeli retry) + yerel .epub çıktısı
  */
@@ -28,9 +28,9 @@ const CATEGORIES = [
 
 const HOURS_LOOKBACK = parseInt(process.env.HOURS_LOOKBACK || '12', 10);
 const PAGES_PER_CAT = parseInt(process.env.PAGES_PER_CAT || '1', 10);
-const FETCH_DELAY_MS = 600;
+const FETCH_DELAY_MS = 500;
 const PAGE_TIMEOUT_MS = 35000;
-const RENDER_WAIT_MS = 2500;
+const RENDER_WAIT_MS = 2000;
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
@@ -80,13 +80,7 @@ function parseTurkishDate(rawText) {
   if (!rawText) return null;
   const text = norm(rawText);
 
-  // 1) ISO veya standart tarih
-  const isoDate = new Date(text);
-  if (!isNaN(isoDate.getTime()) && text.includes('-')) {
-    return isoDate;
-  }
-
-  // 2) DD.MM.YYYY HH:mm veya DD.MM.YYYY
+  // 1) DD.MM.YYYY HH:mm veya DD.MM.YYYY (Örn: "31.10.2026 23:10")
   let m = text.match(/(\d{1,2})\.(\d{1,2})\.(20\d{2})(?:\s+(\d{1,2}):(\d{2}))?/);
   if (m) {
     const d = String(m[1]).padStart(2, '0');
@@ -95,6 +89,19 @@ function parseTurkishDate(rawText) {
     const hh = m[4] ? String(m[4]).padStart(2, '0') : '12';
     const mm = m[5] ? String(m[5]).padStart(2, '0') : '00';
     return new Date(`${y}-${mon}-${d}T${hh}:${mm}:00+03:00`);
+  }
+
+  // 2) ISO 8601 (Örn: "2026-10-31T23:22:44+03:00" veya "2026-10-31T23:10:00")
+  if (text.includes('-') && /20\d{2}-\d{2}-\d{2}/.test(text)) {
+    // Saat dilimi yoksa Türkiye saati (+03:00) olarak yorumla
+    const hasTz = /[Z+-]\d{2}:?\d{2}$/.test(text) || text.endsWith('Z');
+    const normalizedIso = hasTz
+      ? text
+      : text.includes('T')
+        ? `${text}+03:00`
+        : `${text}T12:00:00+03:00`;
+    const isoDate = new Date(normalizedIso);
+    if (!isNaN(isoDate.getTime())) return isoDate;
   }
 
   // 3) "1 Kasım 2026 08:30" veya "1 Kasım 2026"
@@ -120,7 +127,7 @@ function parseTurkishDate(rawText) {
 // ===================================================
 async function loginToOksijen(page) {
   if (!OXY_EMAIL || !OXY_PASSWORD) {
-    log('⚠️ OXY_EMAIL veya OXY_PASSWORD tanımlı değil! Giriş yapılmadan devam ediliyor (Paywall takılabilir).');
+    log('⚠️ OXY_EMAIL veya OXY_PASSWORD tanımlı değil! Giriş yapılmadan devam ediliyor.');
     return false;
   }
 
@@ -129,14 +136,12 @@ async function loginToOksijen(page) {
     await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT_MS });
     await sleep(2000);
 
-    // Üst menüdeki "Giriş yap" butonunu bul ve tıkla (modal açar)
     const loginTrigger = page.locator('a:has-text("Giriş yap"), button:has-text("Giriş yap"), [data-bs-target*="login"], .login-btn').first();
     if (await loginTrigger.count() > 0) {
       await loginTrigger.click({ timeout: 8000 }).catch(() => {});
       await sleep(1200);
     }
 
-    // Modal içindeki e-posta ve şifre alanlarını doldur
     const emailInput = page.locator('.login input[type="email"], input[placeholder*="E-posta"], input[type="email"]').first();
     const passInput = page.locator('.login input[type="password"], input[placeholder*="Şifre"], input[type="password"]').first();
 
@@ -179,16 +184,7 @@ async function fetchCategoryLinks(page, slug) {
       const html = await page.content();
       const $ = cheerio.load(html);
 
-      // Tampermonkey betiğindeki gibi "Editörün Seçtikleri" bloğunu hariç tut
-      $('*').each((_, el) => {
-        if ($(el).children().length === 0 && norm($(el).text()) === 'Editörün Seçtikleri') {
-          $(el).parent().parent().attr('data-ignore-links', 'true');
-        }
-      });
-
       $('a[href]').each((_, el) => {
-        if ($(el).closest('[data-ignore-links="true"]').length > 0) return;
-
         let href = ($(el).attr('href') || '').trim();
         if (!href || href.startsWith('javascript') || href.startsWith('#')) return;
         if (href.startsWith('/')) href = BASE + href;
@@ -196,21 +192,20 @@ async function fetchCategoryLinks(page, slug) {
 
         const clean = href.split('?')[0].split('#')[0];
         if (clean === `${BASE}/${slug}` || clean === BASE) return;
-        if (clean.length < 35) return;
 
-        // Kategori, yazar profil veya galeri indeks sayfalarını atla
+        // Sadece bu kategoriye ait makale linklerini veya sonu haber ID'si (-294567 gibi) ile bitenleri al
+        const isCatPath = clean.startsWith(`${BASE}/${slug}/`);
+        const endsWithId = /-\d{4,}$/.test(clean);
+
+        if (!isCatPath && !endsWithId) return;
         if (
           clean.includes('/kategori/') ||
           clean.includes('/foto-galeri/') ||
+          clean.includes('/yazarlar/') ||
           clean.endsWith('/yazarlar')
         ) {
           return;
         }
-
-        // Makale URL'leri genellikle tire ve sonunda sayı içerir (örn: -294453)
-        const titleAttr = norm($(el).attr('title') || $(el).text() || '');
-        const hasArticleSlug = /-\d{4,}$/.test(clean) || clean.includes('-haber-') || clean.includes('-yazisi-');
-        if (!hasArticleSlug && titleAttr.length < 20) return;
 
         if (!seen.has(clean)) {
           seen.add(clean);
@@ -239,7 +234,9 @@ function cleanCopyrightAndJunk(paragraphs, title) {
     /^A-\s*Yazı Boyutunu Küçült$/i,
     /^Kaydet$/i,
     /^Yazdır$/i,
-    /^Abone Ol$/i
+    /^Abone Ol$/i,
+    /^Haber Giriş:/i,
+    /^Son Güncelleme:/i
   ];
 
   const out = [];
@@ -253,7 +250,7 @@ function cleanCopyrightAndJunk(paragraphs, title) {
     if (cutMarkers.some(m => txt.includes(m))) break;
     if (junkPatterns.some(rx => rx.test(txt))) continue;
     if (out.length === 0 && txt.toLowerCase() === titleLower) continue;
-    if (out.length > 0 && out[out.length - 1].txt === txt) continue;
+    if (out.length > 0 && out[out.length - 1] === txt) continue;
     out.push(txt);
   }
   return out;
@@ -267,7 +264,9 @@ function extractArticleContent($, title) {
     '.ads-container', '.advertisement', '.ad', '.tags', '[class*="reklam"]', '[id*="ad-"]'
   ].join(',')).remove();
 
+  // Gazete Oksijen makale gövdesi öncelikle .resizable-text içinde yer alır
   const selectors = [
+    '.resizable-text',
     '.article-content',
     '.news-detail-text',
     '.news-content',
@@ -281,7 +280,7 @@ function extractArticleContent($, title) {
   let $container = null;
   for (const sel of selectors) {
     const candidate = $clone.find(sel).first();
-    if (candidate.length > 0 && norm(candidate.text()).length > 150) {
+    if (candidate.length > 0 && norm(candidate.text()).length > 120) {
       $container = candidate;
       break;
     }
@@ -333,8 +332,8 @@ async function fetchArticle(page, url) {
     const $ = cheerio.load(html);
 
     const title =
-      norm($('meta[property="og:title"]').attr('content')) ||
       norm($('h1').first().text()) ||
+      norm($('meta[property="og:title"]').attr('content')) ||
       norm($('title').text());
     if (!title || title.length < 5) return null;
 
@@ -345,50 +344,52 @@ async function fetchArticle(page, url) {
       ''
     );
 
-    // Tarih Tespiti
+    // 1) Sayfa içindeki "Haber Giriş: 31.10.2026 23:10" bilgisini yakala (en güvenilir)
     let dateObj = null;
-    const metaPublished =
-      $('meta[property="article:published_time"]').attr('content') ||
-      $('meta[name="datePublished"]').attr('content') ||
-      $('time[datetime]').attr('datetime') ||
-      '';
-
-    if (metaPublished) {
-      dateObj = parseTurkishDate(metaPublished);
+    const bodyText = norm($('body').text());
+    const haberGirisMatch = bodyText.match(/Haber\s+Giriş\s*:\s*(\d{1,2}\.\d{1,2}\.20\d{2}(?:\s+\d{1,2}:\d{2})?)/i);
+    if (haberGirisMatch) {
+      dateObj = parseTurkishDate(haberGirisMatch[1]);
     }
 
-    // JSON-LD içinde datePublished kontrolü
+    // 2) Meta etiketlerinden yakala
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      const metaPublished =
+        $('meta[property="article:published_time"]').attr('content') ||
+        $('meta[name="datePublished"]').attr('content') ||
+        $('time[datetime]').attr('datetime') ||
+        '';
+      if (metaPublished) {
+        dateObj = parseTurkishDate(metaPublished);
+      }
+    }
+
+    // 3) JSON-LD içinden datePublished yakala (@graph dahil)
     if (!dateObj || isNaN(dateObj.getTime())) {
       $('script[type="application/ld+json"]').each((_, el) => {
         if (dateObj && !isNaN(dateObj.getTime())) return;
-        try {
-          const data = JSON.parse($(el).html() || '{}');
-          const items = Array.isArray(data) ? data : [data];
-          for (const item of items) {
-            const dp = item.datePublished || item.dateCreated || item.uploadDate;
-            if (dp) {
-              const parsed = parseTurkishDate(dp);
-              if (parsed && !isNaN(parsed.getTime())) {
-                dateObj = parsed;
-                break;
-              }
-            }
+        const rawJson = $(el).html() || '';
+        const dpMatch = rawJson.match(/"datePublished"\s*:\s*"([^"]+)"/);
+        if (dpMatch) {
+          const parsed = parseTurkishDate(dpMatch[1]);
+          if (parsed && !isNaN(parsed.getTime())) {
+            dateObj = parsed;
           }
-        } catch {}
+        }
       });
     }
 
-    // Sayfa metni içinden tarih yakalama
+    // 4) Genel tarih formatı yedeği
     if (!dateObj || isNaN(dateObj.getTime())) {
-      const bodyText = norm($('body').text());
-      const m1 = bodyText.match(/\b(\d{1,2}\.\d{1,2}\.20\d{2}(?:\s+\d{1,2}:\d{2})?)\b/);
-      const m2 = bodyText.match(/\b(\d{1,2}\s+(?:Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+20\d{2}(?:\s+\d{1,2}:\d{2})?)\b/i);
+      const m1 = bodyText.match(/\b(\d{1,2}\.\d{1,2}\.20\d{2}\s+\d{1,2}:\d{2})\b/);
       if (m1) dateObj = parseTurkishDate(m1[1]);
-      else if (m2) dateObj = parseTurkishDate(m2[1]);
     }
 
     const contentHtml = extractArticleContent($, title);
-    if (!contentHtml || contentHtml.length < 120) return null;
+    if (!contentHtml || contentHtml.length < 80) {
+      log(`  ⚠️ İçerik kısa veya boş (${url.split('/').pop()})`);
+      return null;
+    }
 
     return {
       url,
@@ -434,6 +435,8 @@ async function scrapeAll() {
       log(`  └ ${links.length} aday bağlantı bulundu.`);
 
       const categoryArticles = [];
+      let oldStreak = 0;
+
       for (const link of links) {
         if (seenUrls.has(link)) continue;
         seenUrls.add(link);
@@ -443,15 +446,22 @@ async function scrapeAll() {
         if (!art) continue;
 
         if (art.date && !isNaN(art.date.getTime())) {
-          // Eğer makale saat bilgisi içermiyorsa (sadece gün bilgisi varsa, saat 12:00 atanmışsa)
-          // ve aynı gün veya dün içindeyse saat farkından dolayı yanlışlıkla elenmesini önle
           if (art.date < cutoff) {
+            oldStreak++;
+            log(`  ⏭️ Eski haber atlandı (${art.date.toISOString()}): ${art.title.substring(0, 45)}...`);
+            // Üst üste 8 eski habere denk geldiysek bu kategorideki daha eski haberleri taramayı bırak
+            if (oldStreak >= 8) {
+              log(`  ⏹️ ${cat.name} kategorisinde zaman sınırının altına inildi, sonraki kategoriye geçiliyor.`);
+              break;
+            }
             continue;
           }
+          oldStreak = 0;
         }
 
         categoryArticles.push(art);
-        log(`  ✅ [${cat.name}] ${art.title.substring(0, 60)}...`);
+        const dateTag = art.date ? art.date.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Istanbul' }) : 'Saat yok';
+        log(`  ✅ [${cat.name} - ${dateTag}] ${art.title.substring(0, 55)}...`);
       }
 
       if (categoryArticles.length > 0) {
@@ -741,7 +751,7 @@ async function uploadToDrive(base64Content, fileName) {
 // ANA AKIŞ
 // ===================================================
 async function main() {
-  log('🚀 Oksijen Günlük EPUB v3.0 başladı');
+  log('🚀 Oksijen Günlük EPUB v3.1 başladı');
   const startTime = Date.now();
 
   const grouped = await scrapeAll();
@@ -772,7 +782,6 @@ async function main() {
   const catPart = CATEGORIES.map(c => safeFileName(c.name).replace(/\s+/g, '')).join('-');
   const fileName = `Oksijen_${catPart}_${fileDate}_${hourSafe}-00.epub`;
 
-  // GitHub Actions Artifact olarak da indirilebilmesi için diske kaydet
   fs.writeFileSync(path.join(process.cwd(), fileName), Buffer.from(base64, 'base64'));
   log(`💾 Dosya diske kaydedildi: ${fileName}`);
 
