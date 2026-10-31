@@ -1,0 +1,38 @@
+name: 📰 Günlük RSS Arşivi
+
+on:
+  schedule:
+    - cron: '0 6 * * *'      # Her gün 06:00 UTC = 09:00 TSİ
+  workflow_dispatch:          # Manuel çalıştırma
+
+permissions:
+  contents: write
+
+jobs:
+  arsivle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Repoyu çek
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Bağımlılıkları yükle
+        run: pip install -r requirements.txt
+
+      - name: RSS'leri çek ve arşivle
+        run: python scripts/fetch_rss.py
+
+      - name: Değişiklikleri commit et
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "📰 Günlük RSS arşivi — ${{ github.run_id }}"
+          file_pattern: 'arsiv/**/*.md data/*.json INDEX.md'
+          commit_user_name: 'oksijen-bot'
+          commit_user_email: 'bot@users.noreply.github.com'
