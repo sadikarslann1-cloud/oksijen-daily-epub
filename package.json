@@ -1,17 +1,1 @@
-{
-  "name": "oksijen-daily-epub",
-  "version": "2.0.0",
-  "description": "Oksijen + T24 günlük EPUB üretici (GitHub Actions)",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "cheerio": "^1.0.0",
-    "jszip": "^3.10.1",
-    "playwright": "^1.49.0"
-  }
-}
+
