@@ -1,24 +1,20 @@
-name: O2
+name: Oksijen Günlük EPUB
 
 on:
   schedule:
-    - cron: '0 3 * * *'    # 06:00 TR — Oksijen
+    - cron: '0 3 * * *'  # Her gün 06:00 TR
   workflow_dispatch:
     inputs:
-      build_target:
-        description: 'Hangi site inşa edilsin?'
+      hours_lookback:
+        description: 'Son kaç saatin haberleri çekilsin?'
         required: true
-        default: 'both'
-        type: choice
-        options:
-          - oksijen
+        default: '12'
+        type: string
 
 jobs:
-
   build-oksijen:
-    if: (github.event_name == 'workflow_dispatch' && (github.event.inputs.build_target == 'both' || github.event.inputs.build_target == 'oksijen')) || github.event.schedule == '0 3 * * *' || github.event.schedule == '0 13 * * *'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repo
@@ -27,12 +23,26 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
 
       - name: Install dependencies
         run: npm install
 
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
       - name: Build Oksijen EPUB and upload to Drive
         env:
           OXY_SCRIPT_URL: ${{ secrets.OXY_SCRIPT_URL }}
+          OXY_EMAIL: ${{ secrets.OXY_EMAIL }}
+          OXY_PASSWORD: ${{ secrets.OXY_PASSWORD }}
+          HOURS_LOOKBACK: ${{ github.event.inputs.hours_lookback || '12' }}
         run: node index.js
+
+      - name: Upload EPUB Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oksijen-epub
+          path: "*.epub"
+          if-no-files-found: ignore
