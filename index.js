@@ -5,15 +5,25 @@ const fs = require('fs');
   console.log("Tarayıcı başlatılıyor...");
   const browser = await puppeteer.launch({ 
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled' // Otomasyon izini gizle
+    ],
     protocolTimeout: 900000 // 15 dakika süre sınırı
   });
   const page = await browser.newPage();
   
-  // Betikten gelen konsol loglarını GitHub ekranında görelim
-  page.on('console', msg => console.log('Sayfa Logu:', msg.text()));
+  // 1. Gerçek bir tarayıcı gibi görünmek için User-Agent ayarla
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   
-  // Eğer bir alert (uyarı) açılırsa loglara yaz ve otomatik kapat
+  // 2. navigator.webdriver özelliğini gizle (bot korumasını atlatmak için)
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+
+  // Konsol ve hata loglarını yakala
+  page.on('console', msg => console.log('Sayfa Logu:', msg.text()));
   page.on('dialog', async dialog => {
     console.log('Sayfa Uyarısı:', dialog.message());
     await dialog.dismiss();
@@ -29,25 +39,28 @@ const fs = require('fs');
   }
 
   console.log("Oksijen sitesine gidiliyor...");
-  await page.goto('https://gazeteoksijen.com/', { waitUntil: 'networkidle2' });
+  try {
+    await page.goto('https://gazeteoksijen.com/', { waitUntil: 'networkidle2', timeout: 60000 });
+  } catch (e) {
+    console.log("Sayfa yüklenirken hata oluştu (403 olabilir). Atlanıyor...");
+  }
 
   console.log("Betik sayfaya enjekte ediliyor...");
   const userscript = fs.readFileSync('./oksiyen.user.js', 'utf8');
   await page.evaluate(userscript);
 
   console.log("Seyrüsefer başlatılıyor...");
-  await page.waitForSelector('#oxyMasterBar button');
+  await page.waitForSelector('#oxyMasterBar button', { timeout: 30000 });
   await page.evaluate(() => {
     document.querySelector('#oxyMasterBar button').click(); // İlk buton: Seyrüsefer
   });
 
   console.log("Makaleler çekiliyor, seçim ekranı bekleniyor...");
   try {
-    // Seçim ekranının gelmesini bekle (Maksimum 10 dakika)
     await page.waitForSelector('#oxySelectionOverlay', { timeout: 600000 }); 
   } catch (e) {
     console.log("HATA: Seçim ekranı 10 dakika içinde açılmadı!");
-    console.log("Olası nedenler: Çerezlerin süresi dolmuş olabilir, site yavaşladı veya Seyrüsefer hiç makale bulamadı.");
+    console.log("Olası nedenler: 403 engeli devam ediyor, çerezler geçersiz veya site yapısı değişti.");
     await browser.close();
     return;
   }
