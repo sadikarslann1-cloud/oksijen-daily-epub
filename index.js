@@ -1,26 +1,25 @@
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 
+// Stealth eklentisini etkinleştir
+puppeteer.use(StealthPlugin());
+
 (async () => {
-  console.log("Tarayıcı başlatılıyor...");
+  console.log("Tarayıcı başlatılıyor (Stealth modu)...");
   const browser = await puppeteer.launch({ 
     headless: 'new',
     args: [
       '--no-sandbox', 
       '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled' // Otomasyon izini gizle
+      '--disable-blink-features=AutomationControlled'
     ],
-    protocolTimeout: 900000 // 15 dakika süre sınırı
+    protocolTimeout: 900000 // 15 dakika
   });
   const page = await browser.newPage();
   
-  // 1. Gerçek bir tarayıcı gibi görünmek için User-Agent ayarla
+  // Ekstra güvenlik için gerçekçi bir User-Agent ayarla
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  
-  // 2. navigator.webdriver özelliğini gizle (bot korumasını atlatmak için)
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
 
   // Konsol ve hata loglarını yakala
   page.on('console', msg => console.log('Sayfa Logu:', msg.text()));
@@ -42,7 +41,7 @@ const fs = require('fs');
   try {
     await page.goto('https://gazeteoksijen.com/', { waitUntil: 'networkidle2', timeout: 60000 });
   } catch (e) {
-    console.log("Sayfa yüklenirken hata oluştu (403 olabilir). Atlanıyor...");
+    console.log("Sayfa yüklenirken hata oluştu. Devam ediliyor...");
   }
 
   console.log("Betik sayfaya enjekte ediliyor...");
