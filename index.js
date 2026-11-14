@@ -5,13 +5,28 @@ const fs = require('fs');
   console.log("Tarayıcı başlatılıyor...");
   const browser = await puppeteer.launch({ 
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    protocolTimeout: 900000 // 15 dakika süre sınırı
   });
   const page = await browser.newPage();
   
+  // Betikten gelen konsol loglarını GitHub ekranında görelim
+  page.on('console', msg => console.log('Sayfa Logu:', msg.text()));
+  
+  // Eğer bir alert (uyarı) açılırsa loglara yaz ve otomatik kapat
+  page.on('dialog', async dialog => {
+    console.log('Sayfa Uyarısı:', dialog.message());
+    await dialog.dismiss();
+  });
+
   console.log("Çerezler yükleniyor...");
-  const cookies = JSON.parse(process.env.OKSIJEN_COOKIES);
-  await page.setCookie(...cookies);
+  try {
+    const cookies = JSON.parse(process.env.OKSIJEN_COOKIES);
+    await page.setCookie(...cookies);
+  } catch (e) {
+    console.error("Çerezler yüklenirken hata oluştu. JSON formatını kontrol edin.", e);
+    process.exit(1);
+  }
 
   console.log("Oksijen sitesine gidiliyor...");
   await page.goto('https://gazeteoksijen.com/', { waitUntil: 'networkidle2' });
@@ -27,8 +42,15 @@ const fs = require('fs');
   });
 
   console.log("Makaleler çekiliyor, seçim ekranı bekleniyor...");
-  // Seçim ekranının gelmesini bekle (Maksimum 10 dakika)
-  await page.waitForSelector('#oxySelectionOverlay', { timeout: 600000 }); 
+  try {
+    // Seçim ekranının gelmesini bekle (Maksimum 10 dakika)
+    await page.waitForSelector('#oxySelectionOverlay', { timeout: 600000 }); 
+  } catch (e) {
+    console.log("HATA: Seçim ekranı 10 dakika içinde açılmadı!");
+    console.log("Olası nedenler: Çerezlerin süresi dolmuş olabilir, site yavaşladı veya Seyrüsefer hiç makale bulamadı.");
+    await browser.close();
+    return;
+  }
 
   console.log("Seçim ekranı geldi, Drive'a Gönder butonuna basılıyor...");
   await page.evaluate(() => {
@@ -36,7 +58,6 @@ const fs = require('fs');
   });
 
   console.log("Drive'a yükleniyor, işlemin bitmesi bekleniyor...");
-  // Yükleme işleminin tamamlanması için 30 saniye bekle
   await new Promise(r => setTimeout(r, 30000)); 
 
   console.log("İşlem tamamlandı, tarayıcı kapatılıyor.");
